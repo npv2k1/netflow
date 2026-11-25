@@ -19,6 +19,12 @@ import {
   resolveAllNodeNics,
 } from '@/lib/network/simulation';
 import {
+  ParsedDiagramResult,
+  renderSvgToPngBlob,
+  serializeDiagramToJson,
+  slugifyFilename,
+} from '@/lib/network/io';
+import {
   AiGeneratedDiagram,
   DeviceType,
   NetworkEdge,
@@ -29,6 +35,7 @@ import {
 } from '@/lib/network/types';
 import { AiAssistantPanel } from './AiAssistantPanel';
 import { DevicePalette } from './DevicePalette';
+import { ImportExportModal } from './ImportExportModal';
 import { InspectorPanel } from './InspectorPanel';
 import { NetworkCanvas } from './NetworkCanvas';
 import { PacketFlowPanel } from './PacketFlowPanel';
@@ -62,6 +69,7 @@ export function NetworkStudio({ aiEnabled = false }: NetworkStudioProps) {
 
   const [rightTab, setRightTab] = useState<RightTab>('flow');
   const [templatesOpen, setTemplatesOpen] = useState(false);
+  const [importExportOpen, setImportExportOpen] = useState(false);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
 
   // Packet flow simulation state
@@ -556,22 +564,122 @@ export function NetworkStudio({ aiEnabled = false }: NetworkStudioProps) {
     []
   );
 
-  const handleExportSvg = useCallback(() => {
-    const svgText = exportDiagramToSvg(nodes, edges, diagramTitle);
-    const blob = new Blob([svgText], { type: 'image/svg+xml;charset=utf-8' });
+  const downloadBlob = useCallback((blob: Blob, filename: string) => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${diagramTitle
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/gi, '-')
-      .replace(/(^-|-$)/g, '') || 'so-do-mang'}.svg`;
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+  }, []);
+
+  const handleExportJson = useCallback(() => {
+    const jsonText = serializeDiagramToJson({
+      title: diagramTitle,
+      nodes,
+      edges,
+      simSourceId,
+      simTargetId,
+      scenarioId,
+    });
+    const blob = new Blob([jsonText], {
+      type: 'application/json;charset=utf-8',
+    });
+    downloadBlob(blob, `${slugifyFilename(diagramTitle)}.json`);
+    showToast('Đã xuất tệp sơ đồ mạng (.json)');
+  }, [
+    diagramTitle,
+    nodes,
+    edges,
+    simSourceId,
+    simTargetId,
+    scenarioId,
+    downloadBlob,
+    showToast,
+  ]);
+
+  const handleExportSvg = useCallback(() => {
+    const svgText = exportDiagramToSvg(nodes, edges, diagramTitle);
+    const blob = new Blob([svgText], { type: 'image/svg+xml;charset=utf-8' });
+    downloadBlob(blob, `${slugifyFilename(diagramTitle)}.svg`);
     showToast('Đã tải xuống ảnh sơ đồ định dạng SVG');
-  }, [nodes, edges, diagramTitle, showToast]);
+  }, [nodes, edges, diagramTitle, downloadBlob, showToast]);
+
+  const handleExportPng = useCallback(async () => {
+    try {
+      const svgText = exportDiagramToSvg(nodes, edges, diagramTitle);
+      const pngBlob = await renderSvgToPngBlob(svgText);
+      downloadBlob(pngBlob, `${slugifyFilename(diagramTitle)}.png`);
+      showToast('Đã tải xuống ảnh sơ đồ định dạng PNG');
+    } catch {
+      showToast('Không thể xuất ảnh PNG trên trình duyệt này. Vui lòng thử SVG.');
+    }
+  }, [nodes, edges, diagramTitle, downloadBlob, showToast]);
+
+  const handleCopyJson = useCallback(async (): Promise<boolean> => {
+    const jsonText = serializeDiagramToJson({
+      title: diagramTitle,
+      nodes,
+      edges,
+      simSourceId,
+      simTargetId,
+      scenarioId,
+    });
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(jsonText);
+        showToast('Đã sao chép mã JSON sơ đồ vào bộ nhớ tạm');
+        return true;
+      }
+      return false;
+    } catch {
+      showToast('Không thể truy cập bộ nhớ tạm để sao chép JSON');
+      return false;
+    }
+  }, [diagramTitle, nodes, edges, simSourceId, simTargetId, scenarioId, showToast]);
+
+  const handleImportDiagram = useCallback(
+    (data: ParsedDiagramResult) => {
+      pushHistory();
+      setDiagramTitle(data.title);
+      setNodes(data.nodes);
+      setEdges(data.edges);
+      setSelectedNodeId(null);
+      setSelectedEdgeId(null);
+      setIsSimulating(false);
+      setActiveStepIndex(0);
+      setSegmentProgress(1);
+
+      if (data.simulation) {
+        setSimSourceId(data.simulation.sourceId);
+        setSimTargetId(data.simulation.targetId);
+        setScenarioId(data.simulation.scenarioId);
+      } else if (data.nodes.length >= 2) {
+        const endpoint =
+          data.nodes.find((n) => ['laptop', 'pc', 'phone'].includes(n.type)) ??
+          data.nodes[data.nodes.length - 1];
+        const dest =
+          data.nodes.find(
+            (n) =>
+              n.id !== endpoint.id &&
+              ['internet', 'server', 'dns', 'printer'].includes(n.type)
+          ) ?? data.nodes.find((n) => n.id !== endpoint.id)!;
+        setSimSourceId(endpoint.id);
+        setSimTargetId(dest.id);
+        setScenarioId('web_https');
+      } else {
+        setSimSourceId('');
+        setSimTargetId('');
+      }
+
+      showToast(
+        `Đã nhập sơ đồ "${data.title}" (${data.nodes.length} thiết bị, ${data.edges.length} kết nối)`
+      );
+    },
+    [pushHistory, showToast]
+  );
 
   // Global keyboard shortcuts (Undo, Delete)
   useEffect(() => {
@@ -706,10 +814,10 @@ export function NetworkStudio({ aiEnabled = false }: NetworkStudioProps) {
           </button>
           <button
             type="button"
-            onClick={handleExportSvg}
+            onClick={() => setImportExportOpen(true)}
             className="hover:text-slate-900 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
           >
-            Xuất ảnh SVG
+            Nhập / Xuất
           </button>
         </nav>
 
@@ -932,6 +1040,21 @@ export function NetworkStudio({ aiEnabled = false }: NetworkStudioProps) {
         open={templatesOpen}
         onClose={() => setTemplatesOpen(false)}
         onSelectTemplate={handleLoadTemplate}
+      />
+
+      {/* Import / Export Diagram Modal */}
+      <ImportExportModal
+        open={importExportOpen}
+        onClose={() => setImportExportOpen(false)}
+        diagramTitle={diagramTitle}
+        onChangeDiagramTitle={setDiagramTitle}
+        nodeCount={nodes.length}
+        edgeCount={edges.length}
+        onExportJson={handleExportJson}
+        onExportSvg={handleExportSvg}
+        onExportPng={handleExportPng}
+        onCopyJson={handleCopyJson}
+        onImportDiagram={handleImportDiagram}
       />
 
       {/* Non-intrusive Feedback Toast */}
